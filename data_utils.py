@@ -2,7 +2,7 @@ import numpy as np
 import tensorflow as tf
 
 
-def get_bpe_vocab(vocab_file):
+def get_vocab(vocab_file):
     special_toks = ['<s>', '</s>', '<UNK>', '<PAD>']
     c = {}
     word_idx = 1
