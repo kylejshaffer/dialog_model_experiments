@@ -3,6 +3,7 @@ import numpy as np
 import tensorflow as tf
 
 from keras.models import Model
+from keras.layers import Wrapper
 from keras.layers import *
 from keras.initializers import *
 
@@ -235,3 +236,26 @@ class PositionwiseFeedForward(object):
         # Residual connection
         output = Add()([output, x])
         return self.layer_norm(output)
+
+class SampledSoftmax(Layer):
+    def __init__(self, num_sampled, num_classes,
+                projection, bias, hidden_size):
+        self.weights_reshaped = tf.transpose(projection)
+        self.bias = bias
+        self.num_classes = num_classes
+        self.num_sampled = num_sampled
+        self.hidden_size = hidden_size
+
+    def __call__(self, y_true, input):
+        """ reshaping of y_true and input to make them fit each other """
+        input = tf.reshape(input, (-1, self.hidden_size))
+        y_true = tf.reshape(y_true, (-1, 1))
+
+        return tf.nn.sampled_softmax_loss(
+            weights=self.weights_reshaped,
+            biases=self.bias,
+            labels=y_true,
+            inputs=input,
+            num_sampled=self.num_sampled,
+            num_classes=self.num_classes,
+            partition_strategy='div')
