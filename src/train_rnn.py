@@ -13,7 +13,7 @@ def train(args):
     if args.model_type == 'rnn':
         print('Training RNN...')
         rnn = RNNSeq2Seq(args=args, vocab=vocab)
-        rnn.train_keras()
+        rnn.train()
     elif args.model_type == 'han_rnn':
         print('Training HAN-RNN...')
         han_rnn = HanRnnSeq2Seq(args=args, vocab=vocab)
@@ -22,6 +22,7 @@ def train(args):
 if __name__ == '__main__':
     parser = ArgumentParser()
     parser.add_argument('--gpu', type=int, required=False, default=0)
+    parser.add_argument('--model_name', type=str, required=False, default='lstm_att_movie_transfer_chatbot_epoch{:02d}_loss{:.3f}.h5')
     parser.add_argument('--train_file', type=str, required=False, default='/data/users/kyle.shaffer/ased_data/combined_multilabel_train.jl')
     parser.add_argument('--valid_file', type=str, required=False, default='/data/users/kyle.shaffer/ased_data/combined_multilabel_valid.jl')
     parser.add_argument('--vocab_file', type=str, required=False, default='')
