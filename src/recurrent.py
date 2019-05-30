@@ -319,6 +319,7 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
         self.opt_string = args.optimizer
         self.rec_cell_selector = {'lstm': LSTM, 'gru': GRU}
         self.rec_cell = self.rec_cell_selector[args.rec_cell]
+        self.encoder_type = args.encoder_type
         self.embedding_dim = args.embedding_dim
         self.encoder_dim = args.encoder_dim
         self.decoder_dim = args.decoder_dim
@@ -339,6 +340,7 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
         self._choose_optimizer()
         self._log_params()
         self.build_model()
+        # self.build_functional_model()
 
     def _log_params(self):
         print('\nTRAINING PARAMS')
@@ -355,6 +357,55 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
     def sparse_loss(self, y_true, y_hat):
         return K.sparse_categorical_crossentropy(target=y_true, output=y_hat, from_logits=True)
 
+    def _dot_attention_block(self, args):
+        encoder_output, decoder_output = args
+        attention = Dot(axes=[2, 2], name='decoder_encoder_dot')([decoder_output, encoder_output])
+        attention = Activation('softmax', name='attention_probs')(attention)
+        context = Dot(axes=[2, 1], name='att_encoder_context')([attention, encoder_output])
+        decoder_combined_context = Concatenate(name='decoder_context_concat')([context, decoder_output])
+        return decoder_combined_context
+
+    def build_functional_model(self):
+        word_input = Input(shape=(None,), name='word_input')
+        decoder_input = Input(shape=(None,), name='decoder_input')
+        conversation_input = Input(shape=(None, None), name='conversation_input')
+
+        # Word-level Encoder
+        embed_layer = Embedding(input_dim=self.vocab_size, output_dim=self.embedding_dim, mask_zero=True, name='embedding')
+        word_encoder_layers = [Bidirectional(self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=False)) if self.encoder_type == 'bidi' \
+                        else self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=False) for _ in range(self.num_encoder_layers)]
+        word_att_layer = AttLayer(attention_dim=self.encoder_dim)
+        # Utterance-level Encoder
+        utt_encoder_layer = self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=True, name='utterance_rnn')
+
+        # Build word-level encoder
+        word_embedded = embed_layer(word_input)
+        word_embedded = Dropout(0.2)(word_embedded)
+        for l_ix, l in enumerate(word_encoder_layers):
+            if l_ix == 0:
+                h_out = l(word_embedded)
+            else:
+                h_out = l(h_out)
+        h_att_word = word_att_layer(h_out)
+
+        word_encoder = Model(inputs=word_input, output=h_att_word)
+
+        # Build context-level encoder
+        context_encoder = TimeDistributed(word_encoder)(conversation_input)
+        context_h_out, state_h, state_c = utt_encoder_layer(context_encoder)
+
+        # Decoder
+        decoder_embed = embed_layer(decoder_input)
+        decoder_embed = Dropout(0.2)(decoder_embed)
+        decoder = self.rec_cell(units=self.decoder_dim, return_sequences=True)
+        decoder_output = decoder(decoder_embed)
+        decoder_combined_context = Lambda(self._dot_attention_block)([context_h_out, decoder_output])
+        logits = Dense(units=self.vocab_size, activation='linear', name='logits')(decoder_combined_context)
+
+        self.model = Model(inputs=[conversation_input, decoder_input], outputs=logits)
+        self.model.compile(optimizer=self.optimizer, loss=self.sparse_loss)
+        self.model.summary()
+
     def build_model(self):
         context_input = Input(shape=(None,), name='context_input')
         current_input = Input(shape=(None,), name='current_input')
@@ -368,34 +419,26 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
         current_embed = Dropout(0.2)(current_embed)
 
         # ENCODER
-        bidi_encoder1 = Bidirectional(self.rec_cell(units=self.encoder_dim // 2, return_sequences=True, name='encoder1'), name='bidi_encoder1')
-        bidi_encoder2 = Bidirectional(self.rec_cell(units=self.encoder_dim // 2, return_sequences=True, return_state=False, name='encoder2'), name='bidi_encoder2')
-        # att_layer = AttLayer(attention_dim=self.encoder_dim, name='word_level_attention')
+        context_bidi_encoder1 = self.rec_cell(units=self.encoder_dim, return_sequences=True, name='context_encoder1')
+        context_bidi_encoder2 = self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=False, name='context_encoder2')
+
+        current_bidi_encoder1 = self.rec_cell(units=self.encoder_dim, return_sequences=True, name='current_encoder1')
+        current_bidi_encoder2 = self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=True, name='current_encoder2')
 
         # Encode context
-        context_encoded = bidi_encoder1(context_embed)
-        # context_encoded, context_forward_h, context_forward_c, context_backward_h, context_backward_c = bidi_encoder2(context_encoded)
-        context_encoded = bidi_encoder2(context_encoded)
-        # context_encoded_att = att_layer(context_encoded)
+        context_encoded = context_bidi_encoder1(context_embed)
+        context_encoded = context_bidi_encoder2(context_encoded)
+        context_att_h = AttLayer(attention_dim=200)(context_encoded)
+        context_att_h = Lambda(lambda x: K.expand_dims(x, 1))(context_att_h)
 
         # Encode current utterance to respond to
-        current_encoded = bidi_encoder1(current_embed)
-        # current_encoded, current_forward_h, current_forward_c, current_backward_h, current_backward_c = bidi_encoder2(current_encoded)
-        current_encoded = bidi_encoder2(current_encoded)
-        # current_encoded_att = att_layer(current_encoded)
+        current_encoded = current_bidi_encoder1(current_embed)
+        current_encoded, state_h, state_c = current_bidi_encoder2(current_encoded)
+        current_att_h = AttLayer(attention_dim=200)(current_encoded)
+        current_att_h = Lambda(lambda x: K.expand_dims(x, 1))(current_att_h)
 
-        encoded_concat = Concatenate(axis=1, name='context_current_concat')([context_encoded, current_encoded])
-        encoder_output, state_h, state_c = self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=True, name='top_level_encoder')(encoded_concat)
-        # encoder_output = Add()([context_encoded_att, current_encoded_att])
-        
-        # Aggregate hidden states to pass to decoder
-        # forward_h = Add()([context_forward_h, current_forward_h])
-        # backward_h = Add()([context_backward_h, current_backward_h])
-        # forward_c = Add()([context_forward_c, current_forward_c])
-        # backward_c = Add()([context_backward_c, current_backward_c])
-
-        # state_h = Concatenate(axis=1, name='state_h_concat')([forward_h, backward_h])
-        # state_c = Concatenate(axis=1, name='state_c_concat')([forward_c, backward_c])
+        encoded_concat = Concatenate(axis=1, name='context_current_concat')([context_att_h, current_att_h])
+        encoder_output = self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=False, go_backwards=True, name='top_level_encoder')(encoded_concat)
 
         # DECODER
         rnn_decoder = self.rec_cell(units=self.decoder_dim, return_sequences=True, name='decoder1')
@@ -405,10 +448,11 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
         decoder_output = rnn_decoder(decoder_embed, initial_state=[state_h, state_c])
 
         # Attention
-        attention = Dot(axes=[2, 2], name='decoder_encoder_dot')([decoder_output, encoder_output])
-        attention = Activation('softmax', name='attention_probs')(attention)
-        context = Dot(axes=[2, 1], name='att_encoder_context')([attention, encoder_output])
-        decoder_combined_context = Concatenate(name='decoder_context_concat')([context, decoder_output])
+        # attention = Dot(axes=[2, 2], name='decoder_encoder_dot')([decoder_output, encoder_output])
+        # attention = Activation('softmax', name='attention_probs')(attention)
+        # context = Dot(axes=[2, 1], name='att_encoder_context')([attention, encoder_output])
+        # decoder_combined_context = Concatenate(name='decoder_context_concat')([context, decoder_output])
+        decoder_combined_context = self._dot_attention_block([encoder_output, decoder_output])
 
         logits_out = Dense(units=self.vocab_size, activation='linear', name='logits')(decoder_combined_context)
 
@@ -418,6 +462,9 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
 
     def train(self):
         np.random.seed(7)
+
+        # Hack for changing data-generator
+        model_type = 'recurrent'
 
         test_sents = ["What is your name ?\t My name is John .",
                       "Hey , how are you doing ?\tPretty good , how are you ?",
@@ -431,12 +478,13 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
         n_valid_iters = math.ceil(self.n_valid_examples / self.batch_size)
 
         han_s2s_processing = HanS2SProcessing(train_file=self.train_file, valid_file=self.valid_file, vocab=self.vocab,
-                                              batch_size=self.batch_size, encoder_max_len=250, decoder_max_len=250,
-                                              shuffle_batch=True, model_type='recurrent')
+                                              batch_size=self.batch_size, encoder_max_len=150, decoder_max_len=150,
+                                              shuffle_batch=False, model_type=model_type)
 
         min_lr = 1e-8
         lr_scale = 0.7
         best_loss = 99.
+        
         for e in range(self.n_epochs):
             train_datagen = han_s2s_processing.generate_s2s_batches(mode='train')
             valid_datagen = han_s2s_processing.generate_s2s_batches(mode='valid')
@@ -462,7 +510,7 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
             # self.model.save(os.path.join(model_dir, self.model_name.format(e+1, val_loss)))
             
             # Get sample BLEU score
-            self.get_bleu_score(bleu_datagen)
+            # self.get_bleu_score(bleu_datagen)
 
             # Look at qualitative output
             print('Testing input sentences...')
@@ -511,7 +559,7 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
                     target_seq[0, i+1] = sampled_index
 
                 candidate = [w_id for w_id in predicted_tokens if not(w_id in skip_toks)]
-                reference = [[w_id for w_id in list(decoder_target_i) if not(w_id in skip_toks)]]
+                reference = [[w_id for w_id in decoder_target_i.squeeze() if not(w_id in skip_toks)]]
                 sent_bleu_score = sentence_bleu(reference, candidate)
                 BLEU += sent_bleu_score
                 sent_count += 1
