@@ -21,6 +21,8 @@ def get_vocab(vocab_file, min_freq:int=3):
                 else:
                     c[st] = max(c.values()) + 1
     print('VOCAB SIZE = {}'.format(len(c)))
+    print('Highest word ID:', max(c.values()))
+    print('<PAD> index:', c['<PAD>'])
     return c
 
 class S2SProcessing(object):
@@ -164,11 +166,29 @@ class S2SProcessing(object):
                     decoder_positions = np.asarray([list(range(decoder_in.shape[1])) for _ in range(decoder_in.shape[0])])
                     yield [encoder_in, encoder_positions, decoder_in, decoder_positions], decoder_out
 
-class HanS2SProcessing(S2SProcessing):
+class HanS2SProcessing(object):
     def __init__(self, train_file, valid_file, vocab, encoder_max_len=300, decoder_max_len=100,
                  batch_size=256, shuffle_batch=False, model_type='transformer'):
-        super(HanS2SProcessing, self).__init__(train_file, valid_file, vocab, encoder_max_len=300, decoder_max_len=100,
-                                               batch_size=256, shuffle_batch=False, model_type='transformer')
+        self.train_file = train_file
+        self.valid_file = valid_file
+        self.vocab = vocab
+        self.inv_vocab = {v: k for k, v in self.vocab.items()}
+        self.encoder_max_len = encoder_max_len
+        self.decoder_max_len = decoder_max_len
+        self.batch_size = batch_size
+        self.shuffle_batch = shuffle_batch
+        self.model_type = model_type
+
+    def get_tokid(self, word):
+        if word in self.vocab.keys():
+            tokid = self.vocab[word]
+        else:
+            tokid = self.vocab['<UNK>']
+        return tokid
+
+    def get_orig_word(self, tokid):
+        orig_word = self.inv_vocab[int(tokid)]
+        return orig_word
 
     def get_line(self, data_file):
         bos = '<s>'
@@ -176,8 +196,11 @@ class HanS2SProcessing(S2SProcessing):
         with tf.gfile.GFile(data_file, 'r') as infile:
             for line_ix, line in enumerate(infile):
                 context_words, current_words, decoder_words = line.strip().split('\t')
-                # encoder_words = encoder_words.replace('<SOD>', '')
-                # decoder_words = decoder_words.replace('<EOD>', '')
+                # Train without special dialog-marking tags
+                context_words = context_words.replace('<SOD>', '')
+                current_words = current_words.replace('<SOD>', '')
+                decoder_words = decoder_words.replace('<EOD>', '')
+
                 context_words = context_words.strip().split()
                 current_words = current_words.strip().split()
                 decoder_in_words = decoder_words.strip().split()
@@ -191,23 +214,26 @@ class HanS2SProcessing(S2SProcessing):
                     decoder_in_words = decoder_in_words[: self.decoder_max_len]
                     decoder_out_words = decoder_out_words[: self.decoder_max_len]
                 # Insert special BOS/EOS tokens
-                if context_words[0] == '<SOD>':
-                    context_words.insert(1, bos)
-                else:
-                    context_words.insert(0, bos)
+                # if context_words[0] == '<SOD>':
+                #     context_words.insert(1, bos)
+                # else:
+                #     context_words.insert(0, bos)
+                context_words.insert(0, bos)
                 current_words.insert(0, bos)
                 decoder_in_words.insert(0, bos)
 
-                if decoder_out_words[-1] == '<EOD>':
-                    decoder_out_words.insert(-1, eos)
-                else:
-                    decoder_out_words.append(eos)
+                # if decoder_out_words[-1] == '<EOD>':
+                #     decoder_out_words.insert(-1, eos)
+                # else:
+                #     decoder_out_words.append(eos)
+                decoder_out_words.append(eos)
+
                 # Lookup IDs
                 context_toks = [self.get_tokid(w) for w in context_words]
                 current_toks = [self.get_tokid(w) for w in current_words]
                 decoder_in_toks = [self.get_tokid(w) for w in decoder_in_words]
                 decoder_out_toks = [self.get_tokid(w) for w in decoder_out_words]
-                assert len(decoder_in_toks) == len(decoder_out_toks), "Mismatch in decoder tokens!"
+                # assert len(decoder_in_toks) == len(decoder_out_toks), "Mismatch in decoder tokens!"
                 yield context_toks, current_toks, decoder_in_toks, decoder_out_toks
 
     def s2s_padding(self, context_batch, current_batch, decoder_in_batch, decoder_out_batch,
@@ -242,7 +268,15 @@ class HanS2SProcessing(S2SProcessing):
                 decoder_out_seq_padded = decoder_out_seq + decoder_padding
                 decoder_out_batch[idx] = decoder_out_seq_padded
 
-        return context_batch, current_batch, decoder_in_batch, decoder_out_batch
+        context_batch_pad, current_batch_pad, decoder_in_batch_pad, decoder_out_batch_pad = \
+                                           np.asarray(context_batch), np.asarray(current_batch), np.asarray(decoder_in_batch), np.asarray(decoder_out_batch)
+        
+        if self.shuffle_batch:
+            shuffle_ix = np.random.choice(list(range(current_batch_pad.shape[0])), size=current_batch_pad.shape[0], replace=False)
+            context_batch_pad, current_batch_pad, decoder_in_batch_pad, decoder_out_batch_pad = context_batch_pad[shuffle_ix], current_batch_pad[shuffle_ix], \
+                                                                                                decoder_in_batch_pad[shuffle_ix], decoder_out_batch_pad[shuffle_ix]
+        
+        return context_batch_pad, current_batch_pad, decoder_in_batch_pad, decoder_out_batch_pad
 
     def generate_s2s_batches(self, mode='train'):
         assert mode in {'train', 'valid'}, 'Supply a mode that is either `train` or `valid`!'
@@ -269,13 +303,27 @@ class HanS2SProcessing(S2SProcessing):
                                                                                     context_batch_lengths=context_batch_lengths,
                                                                                     current_batch_lengths=current_batch_lengths,
                                                                                     decoder_batch_lengths=decoder_batch_lengths)
+                    
                     # print(np.asarray(encoder_batch).shape, np.asarray(decoder_in_batch).shape)
-                    yield [np.asarray(context_batch_pad), np.asarray(current_batch_pad), np.asarray(decoder_in_batch_pad)], np.asarray(decoder_out_batch_pad)
+                    if self.model_type == 'hatt':
+                        if context_batch_pad.shape[1] > current_batch_pad.shape[1]:
+                            diff = context_batch_pad.shape[1] - current_batch_pad.shape[1]
+                            pad_mat = np.zeros(shape=(self.batch_size, diff))
+                            current_batch_pad = np.hstack((current_batch_pad, pad_mat))
+                        elif current_batch_pad.shape[1] > context_batch_pad.shape[1]:
+                            diff = current_batch_pad.shape[1] - context_batch_pad.shape[1]
+                            pad_mat = np.zeros(shape=(self.batch_size, diff))
+                            context_batch_pad = np.hstack((context_batch_pad, pad_mat))
+                        context = np.asarray([context_batch_pad, current_batch_pad])
+                        context = np.reshape(a=context, newshape=(self.batch_size, context.shape[-1], 2))
+                        yield [context, decoder_in_batch_pad], decoder_out_batch_pad
+                    elif self.model_type == 'recurrent':
+                        yield [context_batch_pad, current_batch_pad, decoder_in_batch_pad], decoder_out_batch_pad
                     # Reset batch containers
-                    encoder_batch, decoder_in_batch, decoder_out_batch  = [], [], []
-                    encoder_batch_lengths, decoder_batch_lengths = [], []
+                    context_batch, current_batch, decoder_in_batch, decoder_out_batch  = [], [], [], []
+                    context_batch_lengths, current_batch_lengths, decoder_batch_lengths = [], [], []
 
-            if len(encoder_batch) > 0:
+            if len(current_batch_pad) > 0:
                 context_batch_pad, current_batch_pad, decoder_in_batch_pad, decoder_out_batch_pad = self.s2s_padding(context_batch,
                                                                                     current_batch,
                                                                                     decoder_in_batch,
@@ -285,4 +333,17 @@ class HanS2SProcessing(S2SProcessing):
                                                                                     decoder_batch_lengths=decoder_batch_lengths)
                 
                 # print(np.asarray(encoder_batch).shape, np.asarray(decoder_in_batch).shape)
-                yield [np.asarray(context_batch_pad), np.asarray(current_batch_pad), np.asarray(decoder_in_batch_pad)], np.asarray(decoder_out_batch_pad)
+                if self.model_type == 'hatt':
+                    if context_batch_pad.shape[1] > current_batch_pad.shape[1]:
+                        diff = context_batch_pad.shape[1] - current_batch_pad.shape[1]
+                        pad_mat = np.zeros(shape=(self.batch_size, diff))
+                        current_batch_pad = np.hstack((current_batch_pad, pad_mat))
+                    elif current_batch_pad.shape[1] > context_batch_pad.shape[1]:
+                        diff = current_batch_pad.shape[1] - context_batch_pad.shape[1]
+                        pad_mat = np.zeros(shape=(self.batch_size, diff))
+                        context_batch_pad = np.hstack((context_batch_pad, pad_mat))
+                    context = np.asarray([context_batch_pad, current_batch_pad])
+                    context = np.reshape(a=context, newshape=(self.batch_size, context.shape[-1], 2))
+                    yield [context, decoder_in_batch_pad], decoder_out_batch_pad
+                elif self.model_type == 'recurrent':
+                    yield [context_batch_pad, current_batch_pad, decoder_in_batch_pad], decoder_out_batch_pad

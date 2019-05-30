@@ -30,6 +30,7 @@ if __name__ == '__main__':
     parser.add_argument('--n_epochs', type=int, required=False, default=10)
     parser.add_argument('--batch_size', type=int, required=False, default=256)
     parser.add_argument('--model_type', type=str, required=False, default='han_rnn')
+    parser.add_argument('--encoder_type', type=str, required=False, default='uni')
     parser.add_argument('--train_from', type=str, required=False, default='')
     parser.add_argument('--optimizer', type=str, required=False, default='adam')
     parser.add_argument('--rec_cell', type=str, required=False, default='lstm')
