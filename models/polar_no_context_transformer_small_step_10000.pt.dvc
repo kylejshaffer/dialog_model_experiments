@@ -1,0 +1,8 @@
+md5: d93004aa1513e95404766b9ce8f7694b
+outs:
+- cache: true
+  md5: 50682678237a7c76c2663957ef2b7b9e
+  metric: false
+  path: models/polar_no_context_transformer_small_step_10000.pt
+  persist: false
+wdir: ..
