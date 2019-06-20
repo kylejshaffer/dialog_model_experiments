@@ -1,0 +1,8 @@
+md5: b4b544c0afaf43b1e2adbe06b767589a
+outs:
+- cache: true
+  md5: 878003580cad5aef25b9c21118ca865b
+  metric: false
+  path: models/lstm_movie_transfer_chatbot_epoch13_loss4.061.h5
+  persist: false
+wdir: ..
