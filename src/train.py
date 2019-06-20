@@ -1,8 +1,6 @@
 from argparse import ArgumentParser
 
-from transformer import Transformer
-from conv import ConvSeq2Seq
-from recurrent import RnnSeq2Seq, HanRnnSeq2Seq
+from models import Transformer, RNNSeq2Seq, ConvSeq2Seq
 import os
 import data_utils
 

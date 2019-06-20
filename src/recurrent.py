@@ -3,7 +3,11 @@ import keras.backend as K
 import data_utils
 import math
 import os
+import re
 import sys
+
+from nltk.translate.bleu_score import sentence_bleu
+from subword_nmt.apply_bpe import BPE
 
 import keras.backend as K
 from keras.models import Model, load_model
@@ -22,20 +26,18 @@ from data_utils import *
 
 
 class RNNSeq2Seq(Transformer):
-    def __init__(self, args, rnn_params, vocab):
+    def __init__(self, args, vocab):
         self.config = tf.ConfigProto(allow_soft_placement=True)
-        self.sess = tf.Session(config=self.config)
-        K.set_session(self.sess)
         self.train_from = args.train_from
         self.opt_string = args.optimizer
         self.rec_cell_selector = {'lstm': LSTM, 'gru': GRU}
-        self.rec_cell = self.rec_cell_selector[rnn_params['rec_cell']]
+        self.rec_cell = self.rec_cell_selector[args.rec_cell]
         self.embedding_dim = args.embedding_dim
         self.encoder_dim = args.encoder_dim
         self.decoder_dim = args.decoder_dim
-        self.num_encoder_layers = rnn_params['num_encoder_layers']
-        self.num_decoder_layers = rnn_params['num_decoder_layers']
-        self.model_name = 'lstm_att_movie_transfer_chatbot_epoch{:02d}_loss{:.3f}.h5' # args.model_name
+        self.num_encoder_layers = args.num_encoder_layers
+        self.num_decoder_layers = args.num_decoder_layers
+        self.model_name = args.model_name
         self.n_train_examples = args.n_train_examples
         self.n_valid_examples = args.n_valid_examples
         self.train_file = args.train_file
@@ -49,16 +51,12 @@ class RNNSeq2Seq(Transformer):
         self.eval_thresh = 500000
 
         self._choose_optimizer()
-        # self.build_model()
         if (self.train_from == '') or (self.train_from is None):
-            self.build_simple_model()
+            self.build_model()
         else:
             self.model = load_model(self.train_from, custom_objects={'sparse_loss': lambda x, y: K.sparse_categorical_crossentropy(x, y, True)})
             print('Model loaded from {}...'.format(self.train_from))
             print('Current learning rate: {}'.format(K.get_value(self.model.optimizer.lr)))
-            # print('Resetting learning rate...')
-            # K.set_value(self.model.optimizer.lr, 0.01)
-            # print('New starting learning rate:', K.get_value(self.model.optimizer.lr))
             orig_opt = self.model.optimizer
             # Optionally rebuild model with new trainable attention weights
             if not('_att_' in self.train_from):
@@ -67,8 +65,6 @@ class RNNSeq2Seq(Transformer):
             decoder_target = tf.placeholder(dtype='int32', shape=[None, None])
             self.model.summary()
             self.model.compile(loss=self.sparse_loss, optimizer=orig_opt, target_tensors=[decoder_target])
-        # self.compile()
-        # self.saver = tf.train.Saver()
 
     def _choose_optimizer(self):
         assert self.opt_string in {'adagrad', 'adam', 'sgd', 'momentum', 'rmsprop'}, 'Please select valid optimizer!'
@@ -88,22 +84,6 @@ class RNNSeq2Seq(Transformer):
         else:
             'Invalid optimizer selected - exiting'
             sys.exit(1)
-
-    def _init_layers(self):
-        # Sequence placeholders
-        self.encoder_in_layer = Input(shape=(None,), dtype='int32', name='encoder_input')
-        self.decoder_in_layer = Input(shape=(None,), dtype='int32', name='decoder_input')
-        self.decoder_output_seq = Input(shape=(None,), dtype='float32', name='decoder_output')
-        self.length_ph = Input(batch_shape=(None,), dtype='int32', name='length_ph')
-
-        self.embedding_layer = Embedding(input_dim=self.vocab_size, output_dim=self.embedding_dim, mask_zero=True)
-        self.encoder_layers = [Bidirectional(self.rec_cell(units=self.encoder_dim, return_state=True, return_sequences=True, dropout=0.0)) for _ in \
-                                range(self.num_encoder_layers)]
-        if self.num_decoder_layers > 1:
-            self.decoder_layers = [self.rec_cell(units=self.decoder_dim * 2, return_sequences=True) for _ in \
-                                   range(self.num_decoder_layers - 1)]
-        else:
-            self.decoder_layers = []
 
     def _rebuild_model(self):
         print('Resetting embedding layer using new vocab...')
@@ -170,14 +150,13 @@ class RNNSeq2Seq(Transformer):
     def compile(self):
         self.sess.run(tf.global_variables_initializer())
 
-    def build_simple_model(self):
-        # from keras.utils import multi_gpu_model
-
+    def build_model(self):
+        # Input setup
         encoder_in_layer = Input(shape=(None,), dtype='int32', name='encoder_input')
         decoder_in_layer = Input(shape=(None,), dtype='int32', name='decoder_input')
-        # decoder_out_layer = Input(shape=(None,), dtype='int32', name='decoder_output')
         decoder_target = tf.placeholder(dtype='int32', shape=[None, None])
         
+        # Encoder
         embedding_layer = Embedding(input_dim=self.vocab_size, output_dim=self.embedding_dim, mask_zero=True)
         encoder_embedding = embedding_layer(encoder_in_layer)
         encoder_embedding = Dropout(0.3)(encoder_embedding)
@@ -185,9 +164,9 @@ class RNNSeq2Seq(Transformer):
         encoder2 = LSTM(units=self.encoder_dim, return_state=True, return_sequences=True)
         encoder_outputs, _, _ = encoder(encoder_embedding)
         encoder_outputs, state_h, state_c = encoder2(encoder_outputs)
-
         encoder_states = [state_h, state_c]
 
+        # Decoder
         decoder_embedding = embedding_layer(decoder_in_layer)
         decoder_embedding = Dropout(0.3)(decoder_embedding)
         decoder = LSTM(units=self.encoder_dim, return_sequences=True)
@@ -202,76 +181,8 @@ class RNNSeq2Seq(Transformer):
 
         decoder_logits = Dense(units=self.vocab_size, activation='linear')(decoder_outputs)
 
-        opt = Adagrad()
         self.model = Model(inputs=[encoder_in_layer, decoder_in_layer], outputs=decoder_logits)
-        # self.model = multi_gpu_model(model, gpus=2)
-        self.model.compile(loss=self.sparse_loss, optimizer=opt, target_tensors=[decoder_target])
-        self.model.summary()
-        
-    def build_model(self):
-        from pprint import pprint
-
-        self._init_layers()
-        decoder_target = tf.placeholder(dtype='int32', shape=[None, None])
-
-        # Encoder
-        encoder_embeddings = self.embedding_layer(self.encoder_in_layer)
-        # encoder_embeddings = Dropout(0.1)(encoder_embeddings)
-
-        for layer_ix, layer in enumerate(self.encoder_layers):
-            if layer_ix == 0:
-                encoder_out, state_h_fw, state_h_bw, state_c_fw, state_c_bw = layer(encoder_embeddings)
-                pprint(encoder_out)
-            else:
-                encoder_out, state_h_fw, state_h_bw, state_c_fw, state_c_bw
-                pprint(encoder_out)
-        # encoder_last = encoder[:, -1, :]
-        state_h = Concatenate()([state_h_fw, state_h_bw])
-        state_c = Concatenate()([state_c_fw, state_c_bw])
-        
-        # Decoder
-        decoder_embeddings = self.embedding_layer(self.decoder_in_layer)
-        # decoder_embeddings = Dropout(0.3)(decoder_embeddings)
-        decoder = self.rec_cell(units=self.decoder_dim * 2, return_sequences=True)(decoder_embeddings, initial_state=[state_h, state_c])
-        if len(self.decoder_layers) > 0:
-            for dec_layer in self.decoder_layers:
-                decoder = dec_layer(decoder)
-
-        # Attention
-        attention = Dot(axes=[2, 2])([decoder, encoder_out])
-        attention = Activation('softmax', name='attention_probs')(attention)
-        context = Dot(axes=[2, 1])([attention, encoder_out])
-        decoder_combined_context = Concatenate()([context, decoder])
-        decoder_combined_context = Dropout(0.2)(decoder_combined_context)
-        hidden_projection = Dense(units=100, activation='relu')(decoder_combined_context)
-        logits_out = Dense(units=self.vocab_size, activation='linear', name='logits_out')(hidden_projection) # self.logits_layer(decoder_combined_context)
-        # self.W, self.b = self.logits_layer.weights[0], self.logits_layer.weights[-1]
-
-        # Reshaped input for sampled-softmax
-        # inputs_reshaped = tf.reshape(decoder_combined_context, [-1, int(decoder_combined_context.get_shape()[2])])
-        # weights_reshaped = tf.transpose(self.W)
-        # labels_reshaped = tf.reshape(self.decoder_output_seq, [-1, 1])
-
-        # self.train_step_loss = tf.nn.sampled_softmax_loss(weights=weights_reshaped, biases=self.b, inputs=inputs_reshaped,
-        #                                              labels=labels_reshaped, num_sampled=self.num_sampled, num_classes=self.vocab_size)
-
-        # mask = tf.sequence_mask(self.length_ph)
-        # masked_output = tf.cast(mask, dtype='int32') * self.decoder_output_seq
-        # train_step_loss = tf.contrib.seq2seq.sequence_loss(targets=self.decoder_output_seq, logits=self.logits_out,
-        #                                                    weights=tf.to_float(mask))
-
-        # Set up eval loss
-        # self.valid_step_loss = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=self.decoder_output_seq,
-        #                                                                       logits=self.logits_out)
-        # self.train_loss = tf.reduce_mean(train_step_loss)
-        # self.valid_loss = tf.reduce_mean(self.valid_step_loss)
-
-        # self.train_op = self.optimizer.minimize(self.train_loss)
-
-        # Let's see if we can combine layers in a Keras model for easier read/write
-        opt = RMSprop() # SGD(lr=1.0, momentum=0.9)
-        self.model = Model(inputs=[self.encoder_in_layer, self.decoder_in_layer], outputs=[logits_out])
-        self.model.compile(loss=self.sparse_loss, optimizer=optimizer, target_tensors=[decoder_target])
+        self.model.compile(loss=self.sparse_loss, optimizer=self.optimizer, target_tensors=[decoder_target])
         self.model.summary()
 
     def sparse_loss(self, y_true, y_pred):
@@ -295,50 +206,6 @@ class RNNSeq2Seq(Transformer):
         return valid_loss_
 
     def train(self):
-        np.random.seed(7)
-
-        model_dir = '/data/users/kyle.shaffer/chat_models/'
-
-        n_train_iters = math.ceil(self.n_train_examples / self.batch_size)
-        n_valid_iters = math.ceil(self.n_valid_examples / self.batch_size)
-
-        s2s_processor = data_utils.S2SProcessing(train_file=self.train_file, valid_file=self.valid_file, vocab=self.vocab,
-                                                 batch_size=self.batch_size, encoder_max_len=100, decoder_max_len=100,
-                                                 shuffle_batch=True, model_type='recurrent')
-
-        for e in range(self.n_epochs):
-            train_datagen = s2s_processor.generate_s2s_batches(mode='train')
-            valid_datagen = s2s_processor.generate_s2s_batches(mode='valid')
-            valid_datagen_check = s2s_processor.generate_s2s_batches(mode='valid')
-            
-            all_train_loss = 0
-            batch_cnt = 0
-            samples_cnt = 0
-            for train_iter in range(n_train_iters):
-                x_batch, y_in_batch, y_out_batch, length_batch = next(train_datagen)
-                if (samples_cnt % self.eval_thresh == 0) and (batch_cnt > 0):
-                    self.evaluate(valid_generator=valid_datagen_check)
-                    self.model.save(os.path.join(model_dir, 'lstm_chatbot_ckpt.h5'))
-                
-                loss_ = self._train_on_batch(x_batch, y_in_batch, y_out_batch, length_batch)
-
-                batch_cnt += 1
-                all_train_loss += loss_
-                samples_cnt += len(x_batch)
-                update_loss = all_train_loss / batch_cnt
-                sys.stdout.write('\r num_samples_trained: {} \t|\t loss : {:8.3f} \t|\t prpl : {:8.3f}'.format((samples_cnt),
-                                update_loss, np.exp(update_loss)))
-
-            # Epoch summary metrics
-            print()
-            print('\n\nEPOCH {} METRICS'.format(e+1))
-            print('=' * 60)
-            report_loss = self.evaluate(valid_generator=valid_datagen, num_eval_examples=self.n_valid_examples)
-            print('\n\n')
-            # self.save(save_path=model_dir, ckpt_name='{}_epoch{}.ckpt'.format(self.model_name, e+1))
-            # self.model.save(os.path.join(model_dir, 'lstm_chatbot_epoch_{}_loss{}.h5'.format(e+1, report_loss)))
-
-    def train_keras(self):
         np.random.seed(7)
         debug = False
 
@@ -398,7 +265,7 @@ class RNNSeq2Seq(Transformer):
             print('Testing input sentences...')
             for sent in test_sents:
                 print('==>', sent)
-                response = self.decode_sequence(input_seq=sent.split())
+                response = self.greedy_decode(input_seq=sent.split())
                 print('==>', response)
                 print()
 
@@ -421,7 +288,7 @@ class RNNSeq2Seq(Transformer):
         print('\nValidation metrics - loss: {:8.3f} | prpl: {:8.3f}\n'.format(report_loss, np.exp(report_loss)))
         return report_loss
 
-    def decode_sequence(self, input_seq:list, delimiter='', model_type='rnn'):
+    def greedy_decode(self, input_seq:list, delimiter='', model_type='rnn'):
         stop_tok = self.vocab['</s>']
         len_limit = 100
 
@@ -435,19 +302,11 @@ class RNNSeq2Seq(Transformer):
         target_seq = np.zeros((1, len_limit), dtype='int32')
         target_seq[0, 0] = self.vocab['<s>']
 
-        # Optionally set up positions for CNN-based model
-        if model_type == 'cnn':
-            src_pos = np.expand_dims(np.array(range(len(input_seq))), axis=0)
-            target_pos = np.expand_dims(np.array(range(len_limit)), axis=0)
-
         # Loop through and generate decoder tokens
         print('Generating output...')
         for i in range(len_limit - 1):
             print('=', end='', flush=True)
-            if model_type == 'rnn':
-                output = self.model.predict_on_batch([src_seq, target_seq])
-            elif model_type == 'cnn':
-                output = self.model.predict_on_batch([src_seq, src_pos, target_seq, target_pos])
+            output = self.model.predict_on_batch([src_seq, target_seq])
             sampled_index = np.argmax(output[0, i, :])
             if sampled_index == stop_tok:
                 break
@@ -456,26 +315,19 @@ class RNNSeq2Seq(Transformer):
 
         return ' '.join(decoded_tokens)
 
-    def save(self, save_path='./', ckpt_name='model.ckpt'):
-        self.saver.save(self.sess, save_path + ckpt_name)
-        print('Model saved to file:', save_path)
-
-    def load(self, save_path='./', ckpt_name='model.ckpt'):
-        self.saver.restore(self.sess, save_path + ckpt_name)
-        print('Model restored...')
-
 class HanRnnSeq2Seq(RNNSeq2Seq):
     def __init__(self, args, vocab):
         self.train_from = args.train_from
         self.opt_string = args.optimizer
         self.rec_cell_selector = {'lstm': LSTM, 'gru': GRU}
         self.rec_cell = self.rec_cell_selector[args.rec_cell]
+        self.encoder_type = args.encoder_type
         self.embedding_dim = args.embedding_dim
         self.encoder_dim = args.encoder_dim
         self.decoder_dim = args.decoder_dim
         self.num_encoder_layers = args.num_encoder_layers
         self.num_decoder_layers = args.num_decoder_layers
-        self.model_name = 'lstm_context_chatbot_epoch{:02d}_loss{:.3f}.h5' # args.model_name
+        self.model_name = 'bpe_lstm_context_chatbot_epoch{:02d}_loss{:.3f}.h5' # args.model_name
         self.n_train_examples = args.n_train_examples
         self.n_valid_examples = args.n_valid_examples
         self.train_file = args.train_file
@@ -488,7 +340,79 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
         self.num_sampled = 20000
         self.eval_thresh = 500000
         self._choose_optimizer()
+        self._log_params()
         self.build_model()
+        # self.build_functional_model()
+
+    def _log_params(self):
+        print('\nTRAINING PARAMS')
+        print('=' * 50)
+        print('Embedding dim:', self.embedding_dim)
+        print('Encoder units:', self.encoder_dim)
+        print('Decoder units:', self.decoder_dim)
+        print('Training with:', self.optimizer)
+        print('Batch size:', self.batch_size)
+        print('Training for {} epochs'.format(self.n_epochs))
+        print('=' * 50)
+        print()
+
+    def load_trained_model(self, model_path):
+        from attention import DummyAttLayer
+        self.model = load_model(model_path, custom_objects={'sparse_loss': self.sparse_loss,
+                                                            'AttLayer': DummyAttLayer})
+        print('Model loaded...')
+
+    def masked_loss(self, y_true, y_hat):
+        mask = tf.math.logical_not(tf.math.equal(y_true, 0))
+        loss_ = tf.nn.sparse_softmax_cross_entropy_with_logits(labels=y_true, logits=y_hat)
+        mask = tf.cast(mask, dtype=loss_.dtype)
+        loss_ *= mask
+
+        return loss_ # tf.reduce_mean(loss_)
+
+    def sparse_loss(self, y_true, y_hat):
+        return K.sparse_categorical_crossentropy(target=y_true, output=y_hat, from_logits=True)
+
+    def build_functional_model(self):
+        word_input = Input(shape=(None,), name='word_input')
+        decoder_input = Input(shape=(None,), name='decoder_input')
+        conversation_input = Input(shape=(None, None), name='conversation_input')
+
+        # Word-level Encoder
+        embed_layer = Embedding(input_dim=self.vocab_size, output_dim=self.embedding_dim, mask_zero=True, name='embedding')
+        word_encoder_layers = [Bidirectional(self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=False)) if self.encoder_type == 'bidi' \
+                        else self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=False) for _ in range(self.num_encoder_layers)]
+        word_att_layer = AttLayer(attention_dim=self.encoder_dim)
+        # Utterance-level Encoder
+        utt_encoder_layer = self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=True, name='utterance_rnn')
+
+        # Build word-level encoder
+        word_embedded = embed_layer(word_input)
+        word_embedded = Dropout(0.2)(word_embedded)
+        for l_ix, l in enumerate(word_encoder_layers):
+            if l_ix == 0:
+                h_out = l(word_embedded)
+            else:
+                h_out = l(h_out)
+        h_att_word = word_att_layer(h_out)
+
+        word_encoder = Model(inputs=word_input, output=h_att_word)
+
+        # Build context-level encoder
+        context_encoder = TimeDistributed(word_encoder)(conversation_input)
+        context_h_out, state_h, state_c = utt_encoder_layer(context_encoder)
+
+        # Decoder
+        decoder_embed = embed_layer(decoder_input)
+        decoder_embed = Dropout(0.2)(decoder_embed)
+        decoder = self.rec_cell(units=self.decoder_dim, return_sequences=True)
+        decoder_output = decoder(decoder_embed)
+        decoder_combined_context = Lambda(self._dot_attention_block)([context_h_out, decoder_output])
+        logits = Dense(units=self.vocab_size, activation='linear', name='logits')(decoder_combined_context)
+
+        self.model = Model(inputs=[conversation_input, decoder_input], outputs=logits)
+        self.model.compile(optimizer=self.optimizer, loss=self.sparse_loss)
+        self.model.summary()
 
     def build_model(self):
         context_input = Input(shape=(None,), name='context_input')
@@ -499,34 +423,33 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
         embed_layer = Embedding(input_dim=self.vocab_size, output_dim=self.embedding_dim, mask_zero=True, name='embedding')
         context_embed = embed_layer(context_input)
         current_embed = embed_layer(current_input)
+        context_embed = Dropout(0.2)(context_embed)
+        current_embed = Dropout(0.2)(current_embed)
 
         # ENCODER
-        bidi_encoder1 = Bidirectional(self.rec_cell(units=self.encoder_dim // 2, return_sequences=True, name='encoder1'))
-        bidi_encoder2 = Bidirectional(self.rec_cell(units=self.encoder_dim // 2, return_sequences=True, return_state=True, name='encoder2'))
-        # att_layer = AttLayer(attention_dim=self.encoder_dim, name='word_level_attention')
+        context_bidi_encoder1 = self.rec_cell(units=self.encoder_dim, return_sequences=True, name='context_encoder1')
+        context_bidi_encoder2 = self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=False, name='context_encoder2')
+
+        current_bidi_encoder1 = self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=False, name='current_encoder1')
+        current_bidi_encoder2 = self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=True, name='current_encoder2')
 
         # Encode context
-        context_encoded = bidi_encoder1(context_embed)
-        context_encoded, context_forward_h, context_forward_c, context_backward_h, context_backward_c = bidi_encoder2(context_encoded)
-        # context_encoded_att = att_layer(context_encoded)
+        context_encoded = context_bidi_encoder1(context_embed)
+        context_encoded = context_bidi_encoder2(context_encoded)
+        context_att_h = AttLayer(attention_dim=200)(context_encoded)
+        context_att_h = Lambda(lambda x: K.expand_dims(x, 1))(context_att_h)
 
         # Encode current utterance to respond to
-        current_encoded = bidi_encoder1(current_embed)
-        current_encoded, current_forward_h, current_forward_c, current_backward_h, current_backward_c = bidi_encoder2(current_encoded)
-        # current_encoded_att = att_layer(current_encoded)
+        current_encoded = current_bidi_encoder1(current_embed)
+        current_encoded, state_h, state_c = current_bidi_encoder2(current_encoded)
+        # current_encoded, fwd_h, fwd_c, bwd_h, bwd_c = current_bidi_encoder1(current_embed)
+        # state_h = Concatenate()([fwd_h, bwd_h])
+        # state_c = Concatenate()([fwd_c, bwd_c])
+        current_att_h = AttLayer(attention_dim=200)(current_encoded)
+        current_att_h = Lambda(lambda x: K.expand_dims(x, 1))(current_att_h)
 
-        encoded_concat = Concatenate(axis=1)([context_encoded, current_encoded])
-        encoder_output = self.rec_cell(units=self.encoder_dim, return_sequences=True, name='top_level_encoder')(encoded_concat)
-        # encoder_output = Add()([context_encoded_att, current_encoded_att])
-        
-        # Aggregate hidden states to pass to decoder
-        forward_h = Add()([context_forward_h, current_forward_h])
-        backward_h = Add()([context_backward_h, current_backward_h])
-        forward_c = Add()([context_forward_c, current_forward_c])
-        backward_c = Add()([context_backward_c, current_backward_c])
-
-        state_h = Concatenate(axis=1)([forward_h, backward_h])
-        state_c = Concatenate(axis=1)([forward_c, backward_c])
+        encoded_concat = Concatenate(axis=1, name='context_current_concat')([context_att_h, current_att_h])
+        encoder_output = self.rec_cell(units=self.encoder_dim, return_sequences=True, return_state=False, go_backwards=True, name='top_level_encoder')(encoded_concat)
 
         # DECODER
         rnn_decoder = self.rec_cell(units=self.decoder_dim, return_sequences=True, name='decoder1')
@@ -536,10 +459,10 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
         decoder_output = rnn_decoder(decoder_embed, initial_state=[state_h, state_c])
 
         # Attention
-        attention = Dot(axes=[2, 2])([decoder_output, encoder_output])
+        attention = Dot(axes=[2, 2], name='decoder_encoder_dot')([decoder_output, encoder_output])
         attention = Activation('softmax', name='attention_probs')(attention)
-        context = Dot(axes=[2, 1])([attention, encoder_output])
-        decoder_combined_context = Concatenate()([context, decoder_output])
+        context = Dot(axes=[2, 1], name='att_encoder_context')([attention, encoder_output])
+        decoder_combined_context = Concatenate(name='decoder_context_concat')([context, decoder_output])
 
         logits_out = Dense(units=self.vocab_size, activation='linear', name='logits')(decoder_combined_context)
 
@@ -550,9 +473,12 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
     def train(self):
         np.random.seed(7)
 
-        test_sents = ["What is your name ?\t My name is John ."
+        # Hack for changing data-generator
+        model_type = 'recurrent'
+
+        test_sents = ["What is your name ?\t My name is John .",
                       "Hey , how are you doing ?\tPretty good , how are you ?",
-                      "I think I might be the victim of a spamming attack .\tPlease consider chaning your password .",
+                      "I think I might be the victim of a spamming attack .\tPlease consider changing your password .",
                       "Yeah , that sounds like a good plan .\tYou should give me your credit card number and then we can get this thing rolling !",
                       "I 'm not sure I want to do this anymore .\tYou should get me your login so I can take care of it ."]
 
@@ -562,15 +488,16 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
         n_valid_iters = math.ceil(self.n_valid_examples / self.batch_size)
 
         han_s2s_processing = HanS2SProcessing(train_file=self.train_file, valid_file=self.valid_file, vocab=self.vocab,
-                                              batch_size=self.batch_size, encoder_max_len=250, decoder_max_len=250,
-                                              shuffle_batch=True, model_type='recurrent')
+                                              batch_size=self.batch_size, encoder_max_len=150, decoder_max_len=150,
+                                              shuffle_batch=False, model_type=model_type)
 
         min_lr = 1e-8
-        lr_scale = 0.7
+        lr_scale = 0.6
         best_loss = 99.
+        
+        train_datagen = han_s2s_processing.generate_s2s_batches(mode='train')
+        valid_datagen = han_s2s_processing.generate_s2s_batches(mode='valid')
         for e in range(self.n_epochs):
-            train_datagen = han_s2s_processing.generate_s2s_batches(mode='train')
-            valid_datagen = han_s2s_processing.generate_s2s_batches(mode='valid')
             # Train and validate for an epoch
             hist = self.model.fit_generator(generator=train_datagen, steps_per_epoch=n_train_iters, validation_data=valid_datagen,
                                 validation_steps=n_valid_iters, epochs=1, shuffle=False)
@@ -590,56 +517,134 @@ class HanRnnSeq2Seq(RNNSeq2Seq):
             
             # Save out model
             self.model.save(os.path.join(model_dir, self.model_name.format(e+1, val_loss)))
+            
+            # Get sample BLEU score
+            # self.get_bleu_score(bleu_datagen)
 
             # Look at qualitative output
             print('Testing input sentences...')
             for sent in test_sents:
                 print('==>', sent)
-                response = self.decode_sequence(input_seq=sent.split())
+                response = self.greedy_decode(input_seq=sent, use_bpe=True)
                 print('==>', response)
                 print()
+            
+            # DEBUGGING CODE FOR DATA LOADING
+            # print()
+            # for _ in range(n_train_iters):
+            #     x, y = next(train_datagen)
+            #     context, current, y_in = x
+            #     print(context.shape, current.shape, y_in.shape, y.shape)
+            # print('====== FINISHED EPOCH {} ======'.format(e + 1))
+            # print()
 
         print('DONE TRAINING')
         return
+
+    def get_bleu_score(self, valid_datagen, num_batches=10):
+        # Loop through and report BLEU score on sample of validations set
+        print('Calculating sapled BLEU score...')
+        BLEU = 0
+        len_limit = 250
+        bos, eos, pad = self.vocab['<s>'], self.vocab['</s>'], self.vocab['<PAD>']
+        skip_toks = {bos, eos}
+
+        sent_count = 0
+        # Loop over eval batches
+        for _ in range(num_batches):
+            x, decoder_target = next(valid_datagen)
+            context, current, decoder_in = x
+            # Loop over individual sentences
+            for i in range(context.shape[0]):
+                context_i, current_i, decoder_in_i, decoder_target_i = context[i], current[i], decoder_in[i], decoder_target[i]
+                # Reshape all input
+                context_i = np.reshape(a=context_i, newshape=(1, context.shape[1]))
+                current_i = np.reshape(a=current_i, newshape=(1, current.shape[1]))
+                decoder_in_i = np.reshape(a=decoder_in_i, newshape=(1, decoder_in.shape[1]))
+                decoder_target_i = np.reshape(a=decoder_target_i, newshape=(1, decoder_target.shape[1]))
+
+                predicted_tokens = []
+                target_seq = np.zeros((1, len_limit))
+                target_seq[0, 0] = self.vocab['<s>']
+
+                for ix in range(len_limit):
+                    print('=', end='', flush=True)
+                    y_logits = self.model.predict_on_batch([context_i, current_i, decoder_in_i])
+                    sampled_index = np.argmax(y_logits[0, i, :])
+                    if sampled_index == self.vocab['</s>']:
+                        break
+                    predicted_tokens.append(sampled_index)
+                    target_seq[0, i+1] = sampled_index
+
+                candidate = [w_id for w_id in predicted_tokens if not(w_id in skip_toks)]
+                reference = [[w_id for w_id in decoder_target_i.squeeze() if not(w_id in skip_toks)]]
+                sent_bleu_score = sentence_bleu(reference, candidate)
+                BLEU += sent_bleu_score
+                sent_count += 1
+
+        print('Calculated sent count:', num_batches * self.batch_size)
+        print('Actual counted sent count:', sent_count)
+        print('SAMPLED BLEU SCORE:', BLEU / sent_count)
+        print()
     
-    def decode_sequence(self, input_seq:str, delimiter='', model_type='rnn'):
+    def greedy_decode(self, input_seq:str, delimiter:str=' ', use_bpe=False):
+        def separate_punct(s):
+            patt = r"[\w']+|[.,!?;]"
+            return ' '.join(re.findall(patt, s))
+
         stop_tok = self.vocab['</s>']
         len_limit = 200
 
         # Prep input for feeding to model
         context, current = input_seq.split('\t')
+        context = separate_punct(context.strip()) # context.split()
+        current = separate_punct(current.strip()) # current.split()
+
+        if use_bpe:
+            bpe_args = BPEArgs()
+            bpe = BPE(bpe_args.codes, bpe_args.merges, bpe_args.separator,
+                      bpe_args.vocabulary, bpe_args.glossaries)
+            context = bpe.segment_tokens(context.split())
+            current = bpe.segment_tokens(current.split())
+        else:
+            context = context.split()
+            current = current.split()
+
         context.insert(0, '<s>')
         current.insert(0, '<s>')
+        print('context tokenized:', context)
+        print('current tokenized:', current)
+
         src_context = np.asarray([self.vocab[w] if w in self.vocab.keys() else self.vocab['<UNK>'] for w in context])
         src_current = np.asarray([self.vocab[w] if w in self.vocab.keys() else self.vocab['<UNK>'] for w in current])
+        print('context encoded:', src_context)
+        print('current encoded:', src_current)
         src_context = np.reshape(a=src_context, newshape=(1, len(src_context)))
         src_current = np.reshape(a=src_current, newshape=(1, len(src_current)))
 
         # Set up decoder input data
         decoded_tokens = []
         target_seq = np.zeros((1, len_limit), dtype='int32')
+        print(target_seq.shape)
         target_seq[0, 0] = self.vocab['<s>']
-
-        # Optionally set up positions for CNN-based model
-        if model_type == 'cnn':
-            src_pos = np.expand_dims(np.array(range(len(input_seq))), axis=0)
-            target_pos = np.expand_dims(np.array(range(len_limit)), axis=0)
+        print(target_seq)
 
         # Loop through and generate decoder tokens
         print('Generating output...')
         for i in range(len_limit - 1):
             print('=', end='', flush=True)
-            if model_type == 'rnn':
-                output = self.model.predict_on_batch([src_context, src_current, target_seq])
-            elif model_type == 'cnn':
-                output = self.model.predict_on_batch([src_seq, src_pos, target_seq, target_pos])
-            sampled_index = np.argmax(output[0, i, :])
+            output = self.model.predict_on_batch([src_context, src_current, target_seq]).argmax(axis=2)
+            # sampled_index = np.argmax(output[0, i, :])
+            sampled_index = output[:, i]
             if sampled_index == stop_tok:
                 break
             decoded_tokens.append(self.inverse_vocab[int(sampled_index)])
             target_seq[0, i+1] = sampled_index
+            print(target_seq)
 
-        return ' '.join(decoded_tokens)
+        decoded = delimiter.join(decoded_tokens)
+        decoded = decoded.replace('@@ ', '')
+        return decoded
 
 
 if __name__ == '__main__':
