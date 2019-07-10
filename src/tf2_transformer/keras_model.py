@@ -1,9 +1,12 @@
+# Code re-implementing transformer from TF 2.0 into Keras API of older TF version
+# Try install 1.2.1 - if that fails isntall 1.13
 import os
 import re
 
 import numpy as np
 
 import keras
+import keras.backend as K
 import tensorflow as tf
 
 
@@ -13,7 +16,7 @@ def scaled_dot_product_attention(query, key, value, mask):
 
     # scale matmul_qk
     depth = tf.cast(tf.shape(key)[-1], tf.float32)
-    logits = matmul_qk / tf.math.sqrt(depth)
+    logits = matmul_qk / tf.sqrt(depth)
 
     # add the mask to zero out padding tokens
     if mask is not None:
@@ -37,7 +40,7 @@ def create_look_ahead_mask(x):
     padding_mask = create_padding_mask(x)
     return tf.maximum(look_ahead_mask, padding_mask)
 
-class MultiHeadAttention(tf.keras.layers.Layer):
+class MultiHeadAttention(keras.layers.Layer):
     def __init__(self, d_model, num_heads, name="multi_head_attention"):
         super(MultiHeadAttention, self).__init__(name=name)
         self.num_heads = num_heads
@@ -47,11 +50,11 @@ class MultiHeadAttention(tf.keras.layers.Layer):
 
         self.depth = d_model // self.num_heads
 
-        self.query_dense = tf.keras.layers.Dense(units=d_model)
-        self.key_dense = tf.keras.layers.Dense(units=d_model)
-        self.value_dense = tf.keras.layers.Dense(units=d_model)
+        self.query_dense = keras.layers.Dense(units=d_model)
+        self.key_dense = keras.layers.Dense(units=d_model)
+        self.value_dense = keras.layers.Dense(units=d_model)
 
-        self.dense = tf.keras.layers.Dense(units=d_model)
+        self.dense = keras.layers.Dense(units=d_model)
 
     def split_heads(self, inputs, batch_size):
         inputs = tf.reshape(
@@ -59,8 +62,9 @@ class MultiHeadAttention(tf.keras.layers.Layer):
         return tf.transpose(inputs, perm=[0, 2, 1, 3])
 
     def call(self, inputs):
-        query, key, value, mask = inputs['query'], inputs['key'], inputs[
-            'value'], inputs['mask']
+        # query, key, value, mask = inputs['query'], inputs['key'], inputs[
+        #     'value'], inputs['mask']
+        query, key, value, mask = inputs
         batch_size = tf.shape(query)[0]
 
         # linear layers
@@ -93,7 +97,7 @@ class PositionalEncoding(tf.keras.layers.Layer):
         self.pos_encoding = self.positional_encoding(position, d_model)
 
     def get_angles(self, position, i, d_model):
-        angles = 1 / tf.pow(10000, (2 * (i // 2)) / tf.cast(d_model, tf.float32))
+        angles = 1 / tf.pow(10000.0, (2 * (i // 2)) / tf.cast(d_model, tf.float32))
         return position * angles
 
     def positional_encoding(self, position, d_model):
@@ -113,28 +117,54 @@ class PositionalEncoding(tf.keras.layers.Layer):
     def call(self, inputs):
         return inputs + self.pos_encoding[:, :tf.shape(inputs)[1], :]
 
+class LayerNormalization(keras.layers.Layer):
+    def __init__(self, eps=1e-6, **kwargs):
+        self.eps = eps
+        super(LayerNormalization, self).__init__(**kwargs)
+
+    def build(self, input_shape):
+        self.gamma = self.add_weight(name='gamma', shape=input_shape[-1:],
+                                     initializer=keras.initializers.Ones(), trainable=True)
+        self.beta = self.add_weight(name='beta', shape=input_shape[-1:],
+                                    initializer=keras.initializers.Zeros(), trainable=True)
+        super(LayerNormalization, self).build(input_shape)
+
+    def call(self, x):
+        mean = K.mean(x, axis=-1, keepdims=True)
+        std = K.std(x, axis=-1, keepdims=True)
+        return self.gamma * (x - mean) / (std + self.eps) + self.beta
+
+    def compute_output_shape(self, input_shape):
+        return input_shape
+
 def encoder_layer(units, d_model, num_heads, dropout, name="encoder_layer"):
-    inputs = tf.keras.Input(shape=(None, d_model), name="inputs")
-    padding_mask = tf.keras.Input(shape=(1, 1, None), name="padding_mask")
+    inputs = keras.Input(shape=(None, d_model), name="inputs")
+    padding_mask = keras.Input(shape=(1, 1, None), name="padding_mask")
 
-    attention = MultiHeadAttention(
-        d_model, num_heads, name="attention")({
-            'query': inputs,
-            'key': inputs,
-            'value': inputs,
-            'mask': padding_mask
-        })
-    attention = tf.keras.layers.Dropout(rate=dropout)(attention)
-    attention = tf.keras.layers.LayerNormalization(
-        epsilon=1e-6)(inputs + attention)
+    # attention = MultiHeadAttention(
+    #     d_model, num_heads, name="attention")({
+    #         'query': inputs,
+    #         'key': inputs,
+    #         'value': inputs,
+    #         'mask': padding_mask
+    #     })
+    attention = MultiHeadAttention(d_model, num_heads, name="attention")([inputs, inputs, inputs, padding_mask])
 
-    outputs = tf.keras.layers.Dense(units=units, activation='relu')(attention)
-    outputs = tf.keras.layers.Dense(units=d_model)(outputs)
-    outputs = tf.keras.layers.Dropout(rate=dropout)(outputs)
-    outputs = tf.keras.layers.LayerNormalization(
-        epsilon=1e-6)(attention + outputs)
+    attention = keras.layers.Dropout(rate=dropout)(attention)
+    # attention = keras.layers.LayerNormalization(
+    #     epsilon=1e-6)(inputs + attention)
+    attention = LayerNormalization()(inputs + attention)
 
-    return tf.keras.Model(
+    outputs = keras.layers.Dense(units=units, activation='relu')(attention)
+    outputs = keras.layers.Dense(units=d_model)(outputs)
+    outputs = keras.layers.Dropout(rate=dropout)(outputs)
+    # outputs = keras.layers.LayerNormalization(
+    #     epsilon=1e-6)(attention + outputs)
+    outputs = LayerNormalization()(attention + outputs)
+
+    print(type(inputs), type(padding_mask), type(outputs))
+
+    return keras.models.Model(
         inputs=[inputs, padding_mask], outputs=outputs, name=name)
 
 def encoder(embedding_layer, vocab_size,
@@ -149,7 +179,7 @@ def encoder(embedding_layer, vocab_size,
 
     # embeddings = tf.keras.layers.Embedding(vocab_size, d_model)(inputs)
     embeddings = embedding_layer(inputs)
-    embeddings *= tf.math.sqrt(tf.cast(d_model, tf.float32))
+    embeddings *= tf.sqrt(tf.cast(d_model, tf.float32))
     embeddings = PositionalEncoding(vocab_size, d_model)(embeddings)
 
     outputs = tf.keras.layers.Dropout(rate=dropout)(embeddings)
@@ -235,7 +265,6 @@ def decoder(vocab_size, num_layers, units,
         outputs=outputs,
         name=name)
 
-### LOSS FUNCTIONS
 def loss_function(y_true, y_pred):
     max_len = 100
     # y_true = tf.reshape(y_true, shape=(-1, max_len - 1))
@@ -257,24 +286,21 @@ def loss_func(y_true, y_pred):
 
     return tf.reduce_mean(loss_)
 
-def loss_fn(labels, logits):
-    return tf.keras.losses.sparse_categorical_crossentropy(labels, logits, from_logits=True)
+# class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
+#     def __init__(self, d_model, warmup_steps=4000):
+#         super(CustomSchedule, self).__init__()
 
-class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
-    def __init__(self, d_model, warmup_steps=4000):
-        super(CustomSchedule, self).__init__()
+#         self.d_model = d_model
+#         self.d_model = tf.cast(self.d_model, tf.float32)
 
-        self.d_model = d_model
-        self.d_model = tf.cast(self.d_model, tf.float32)
+#         self.warmup_steps = warmup_steps
+#         self.initial_learning_rate = 0.0001
 
-        self.warmup_steps = warmup_steps
-        self.initial_learning_rate = 0.0001
+#     def __call__(self, step):
+#         arg1 = tf.math.rsqrt(step)
+#         arg2 = step * (self.warmup_steps**-1.5)
 
-    def __call__(self, step):
-        arg1 = tf.math.rsqrt(step)
-        arg2 = step * (self.warmup_steps**-1.5)
-
-        return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
+#         return tf.math.rsqrt(self.d_model) * tf.math.minimum(arg1, arg2)
 
     # def get_config(self):
     #     return {
@@ -283,6 +309,9 @@ class CustomSchedule(tf.keras.optimizers.schedules.LearningRateSchedule):
     #     }
 
 class Trainer(object):
+    # TODO:
+    # 1. Refactor so data_generator is defined inside this class
+    # 2. Figure out max-len issue
     def __init__(self, d_model:int, units:int, vocab_size:int, num_layers:int,
                  num_heads:int, dropout:float, epochs:int, batch_size:int, data_generator):
         self.d_model = d_model
@@ -314,9 +343,7 @@ class Trainer(object):
         inputs = tf.keras.Input(shape=(None,), name="inputs")
         dec_inputs = tf.keras.Input(shape=(None,), name="dec_inputs")
 
-        # embedding_layer = tf.keras.layers.Embedding(self.vocab_size, self.d_model, mask_zero=True)
-        context_embedding = tf.keras.layers.Embedding(self.vocab_size, self.d_model, mask_zero=True)
-        response_embedding = tf.keras.layers.Embedding(self.vocab_size, self.d_model, mask_zero=True)
+        embedding_layer = tf.keras.layers.Embedding(self.vocab_size, self.d_model)
 
         enc_padding_mask = tf.keras.layers.Lambda(
             create_padding_mask, output_shape=(1, 1, None),
@@ -332,7 +359,7 @@ class Trainer(object):
             name='dec_padding_mask')(inputs)
 
         enc_outputs = encoder(
-            embedding_layer=context_embedding,
+            embedding_layer=embedding_layer,
             vocab_size=self.vocab_size,
             num_layers=self.num_layers,
             units=self.units,
@@ -342,7 +369,7 @@ class Trainer(object):
         )(inputs=[inputs, enc_padding_mask])
 
         dec_outputs = decoder(
-            embedding_layer=response_embedding,
+            embedding_layer=embedding_layer,
             vocab_size=self.vocab_size,
             num_layers=self.num_layers,
             units=self.units,
@@ -356,7 +383,7 @@ class Trainer(object):
 
         learning_rate = CustomSchedule(self.d_model)
         optimizer = tf.keras.optimizers.Adam(learning_rate, beta_1=0.9, beta_2=0.98, epsilon=1e-9)
-        transformer_model.compile(loss=loss_fn, optimizer=optimizer)
+        transformer_model.compile(loss=loss_function, optimizer=optimizer)
         self.model = transformer_model
         self.model.summary()
 
@@ -368,7 +395,7 @@ class Trainer(object):
         valid_datagen = self.data_generator.batch_generator(mode='valid')
 
         for e in range(self.epochs):
-            hist = self.model.fit_generator(train_datagen, steps_per_epoch=self.n_train_iters, epochs=1,
+            hist = self.model.fit_generator(train_datagen, steps_per_epoch=20, epochs=1,
                                     verbose=1, validation_data=valid_datagen, validation_steps=self.n_valid_iters)
             val_loss = sum(hist.history['val_loss']) / len(hist.history['val_loss'])
 
@@ -383,15 +410,9 @@ class Trainer(object):
         START_TOKEN = self.data_generator.bos
         END_TOKEN = self.data_generator.eos
         sentence = tf.expand_dims(
-            [START_TOKEN] + self.data_generator.tokenizer.encode(sentence), axis=0)
+            START_TOKEN + self.data_generator.tokenizer.encode(sentence) + END_TOKEN, axis=0)
 
-        print('BPE encoded sentence:')
-        print(sentence, '\n')
-        print('Decoded sentence:')
-        decode_sent_ids = [i for i in tf.squeeze(sentence, axis=0) if i < self.data_generator.tokenizer.vocab_size]
-        print(self.data_generator.tokenizer.decode(decode_sent_ids))
-
-        output = tf.expand_dims([START_TOKEN], 0)
+        output = tf.expand_dims(START_TOKEN, 0)
 
         for i in range(100):
             predictions = self.model(inputs=[sentence, output], training=False)
@@ -401,19 +422,19 @@ class Trainer(object):
             predicted_id = tf.cast(tf.argmax(predictions, axis=-1), tf.int32)
 
             # return the result if the predicted_id is equal to the end token
-            if tf.equal(predicted_id, END_TOKEN):
+            if tf.equal(predicted_id, END_TOKEN[0]):
                 break
 
-            # concatenated the predicted_id to the output which is given to the decoder
-            # as its input.
-            output = tf.concat([output, predicted_id], axis=-1)
+        # concatenated the predicted_id to the output which is given to the decoder
+        # as its input.
+        output = tf.concat([output, predicted_id], axis=-1)
 
         return tf.squeeze(output, axis=0)
 
     def predict(self, sentence):
         prediction = self.evaluate(sentence)
 
-        predicted_sentence = self.data_generator.tokenizer.decode([i for i in prediction if i < self.data_generator.tokenizer.vocab_size])
+        predicted_sentence = self.data_generator.tokenizer.decode([i for i in prediction if i < self.vocab_size])
 
         print('Input: {}'.format(sentence))
         print('Output: {}'.format(predicted_sentence))
@@ -421,6 +442,9 @@ class Trainer(object):
         return predicted_sentence
 
 if __name__ == '__main__':
+    import os
+    os.environ['CUDA_VISIBLE_DEVICES'] = '0'
+
     d_model = 128
     units = 512
     vocab_size = 8192
@@ -428,14 +452,23 @@ if __name__ == '__main__':
     num_heads = 4
     dropout = 0.3
 
-    sample_transformer = transformer(
-        vocab_size=vocab_size,
-        num_layers=num_layers,
-        units=units,
-        d_model=d_model,
-        num_heads=num_heads,
-        dropout=dropout,
-        name="sample_transformer")
+    # sample_transformer = transformer(
+    #     vocab_size=vocab_size,
+    #     num_layers=num_layers,
+    #     units=units,
+    #     d_model=d_model,
+    #     num_heads=num_heads,
+    #     dropout=dropout,
+    #     name="sample_transformer")
+
+    embedding_layer = tf.keras.layers.Embedding(vocab_size, d_model)
+    sample_transformer = encoder(embedding_layer, vocab_size,
+                                num_layers,
+                                units,
+                                d_model,
+                                num_heads,
+                                dropout,
+                                name="encoder")
 
     sample_transformer.summary()
 
@@ -444,8 +477,8 @@ if __name__ == '__main__':
     sample_transformer.compile(loss=loss_function, optimizer=optimizer)
     print('Model compiled!')
 
-    sample_transformer.save_weights('../test_transformer_weights.h5')
-    print('Weights saved...')
+    # sample_transformer.save_weights('../test_transformer_weights.h5')
+    # print('Weights saved...')
 
-    sample_transformer.load_weights('../test_transformer_weights.h5')
-    print('Weights loaded!')
+    # sample_transformer.load_weights('../test_transformer_weights.h5')
+    # print('Weights loaded!')
